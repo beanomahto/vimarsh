@@ -1,0 +1,9 @@
+openai>=1.30
+chromadb>=0.5
+rank-bm25>=0.2
+fastapi>=0.110
+uvicorn>=0.29
+python-dotenv>=1.0
+streamlit>=1.38
+python-multipart>=0.0.9
+pypdf>=4.0
