@@ -12,7 +12,9 @@ from app.chat_history import (
     update_title, delete_chat,
 )
 
-API_URL = "http://localhost:8000"
+# API_URL = "http://localhost:8000"
+API_URL = "https://your-backend-url.onrender.com"
+
 
 st.set_page_config(page_title="RAG Chatbot", page_icon="🤖", layout="wide")
 st.title("RAG Chatbot")
