@@ -13,7 +13,7 @@ from app.chat_history import (
 )
 
 # API_URL = "http://localhost:8000"
-API_URL = "https://your-backend-url.onrender.com"
+API_URL = "https://vimarsh-l5x7.onrender.com"
 
 
 st.set_page_config(page_title="RAG Chatbot", page_icon="🤖", layout="wide")
