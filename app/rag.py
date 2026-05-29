@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)  # ━━━ NEW
 _current_provider: str = DEFAULT_PROVIDER
 _current_model: str = PROVIDERS[DEFAULT_PROVIDER]["default_model"]
 _llm_clients: dict[str, OpenAI] = {}
-_embed_fn = DefaultEmbeddingFunction()
+_embed_fn = None
 
 
 def _get_llm() -> tuple[OpenAI, str]:
@@ -493,4 +493,4 @@ def get_stats() -> dict:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # STARTUP: Rebuild indexes from database on cold start
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-_rebuild_from_db()
+# _rebuild_from_db()
