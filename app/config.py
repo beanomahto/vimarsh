@@ -14,10 +14,8 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "")       # ← NEW
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")       # ← NEW
 
 
-import streamlit as st
 
-DATABASE_URL = st.secrets["DATABASE_URL"]
-
+DATABASE_URL = os.getenv("DATABASE_URL", "")       # ← NEW
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DOCUMENTS_DIR = str(BASE_DIR / "documents")
