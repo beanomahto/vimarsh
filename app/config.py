@@ -1,21 +1,15 @@
-# config.py
-
 import os
 from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
 # ── Supabase (NEW) ──────────────────────────────
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")       # ← NEW
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")       # ← NEW
-
-
-
-DATABASE_URL = os.getenv("DATABASE_URL", "")       # ← NEW
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")       
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")       
+DATABASE_URL = os.getenv("DATABASE_URL", "")       
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DOCUMENTS_DIR = str(BASE_DIR / "documents")
@@ -32,21 +26,10 @@ PROVIDERS = {
             "qwen/qwen-3-32b",
         ],
         "default_model": "llama-3.3-70b-versatile",
-    },
-    "openai": {
-        "api_key": OPENAI_API_KEY,
-        "base_url": None,
-        "models": [
-            "gpt-4.1-nano",
-            "gpt-4.1-mini",
-            "gpt-4.1",
-            "gpt-4o-mini",
-        ],
-        "default_model": "gpt-4.1-nano",
-    },
+    }
 }
 
-DEFAULT_PROVIDER = os.getenv("LLM_PROVIDER", "groq").lower()
+DEFAULT_PROVIDER = "groq"
 
 # Chunking (parent-child)
 PARENT_CHUNK_SIZE = 2000

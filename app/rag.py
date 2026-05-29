@@ -6,17 +6,10 @@ import hashlib
 import json
 import logging
 import re
-import os # ━━━ NEW
 from pathlib import Path
 
 import chromadb
-
-# ━━━ NEW: Import OpenAIEmbeddingFunction instead of DefaultEmbeddingFunction
-from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
-from openai import OpenAI
-from rank_bm25 import BM25Okapi
-from pypdf import PdfReader 
-
+from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
 from openai import OpenAI
 from rank_bm25 import BM25Okapi
 from pypdf import PdfReader
@@ -41,12 +34,7 @@ logger = logging.getLogger(__name__)  # ━━━ NEW
 _current_provider: str = DEFAULT_PROVIDER
 _current_model: str = PROVIDERS[DEFAULT_PROVIDER]["default_model"]
 _llm_clients: dict[str, OpenAI] = {}
-
-# ━━━ NEW: Use OpenAI for embeddings to save 200MB of RAM! ━━━
-_embed_fn = OpenAIEmbeddingFunction(
-    api_key=os.getenv("OPENAI_API_KEY"),
-    model_name="text-embedding-3-small"
-)
+_embed_fn = DefaultEmbeddingFunction()
 
 
 def _get_llm() -> tuple[OpenAI, str]:
