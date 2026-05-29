@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)  # ━━━ NEW
 _current_provider: str = DEFAULT_PROVIDER
 _current_model: str = PROVIDERS[DEFAULT_PROVIDER]["default_model"]
 _llm_clients: dict[str, OpenAI] = {}
-_embed_fn = None
+_embed_fn = DefaultEmbeddingFunction()
 
 
 def _get_llm() -> tuple[OpenAI, str]:
