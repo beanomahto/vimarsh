@@ -12,7 +12,12 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 # ── Supabase (NEW) ──────────────────────────────
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")       # ← NEW
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")       # ← NEW
-DATABASE_URL = os.getenv("DATABASE_URL", "")       # ← NEW
+
+
+import streamlit as st
+
+DATABASE_URL = st.secrets["DATABASE_URL"]
+
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DOCUMENTS_DIR = str(BASE_DIR / "documents")
