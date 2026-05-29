@@ -14,7 +14,7 @@ from app.chat_history import (
     update_title, delete_chat,
 )
 
-# API_URL = "http://localhost:8000"
+#API_URL = "http://localhost:8000"
 API_URL = "https://vimarsh-l5x7.onrender.com"
 
 

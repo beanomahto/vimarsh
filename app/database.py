@@ -11,8 +11,7 @@ from app.config import DATABASE_URL
 
 def _get_conn():
     """Get a new database connection."""
-    return psycopg2.connect(DATABASE_URL, 
-                            sslmode="require",cursor_factory=RealDictCursor)
+    return psycopg2.connect(DATABASE_URL,sslmode="require",cursor_factory=RealDictCursor)
 
 
 @contextmanager
