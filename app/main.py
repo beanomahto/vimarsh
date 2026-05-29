@@ -1,3 +1,5 @@
+# main.py
+
 import json
 import os
 import shutil
@@ -7,12 +9,22 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from app.config import DOCUMENTS_DIR, PROVIDERS
+from app.config import DOCUMENTS_DIR, PROVIDERS, SUPABASE_URL, SUPABASE_KEY
 from app.rag import ingest_file, query, query_sync, get_stats, set_model, get_current_model
 
 app = FastAPI(title="RAG Chatbot API")
 
 os.makedirs(DOCUMENTS_DIR, exist_ok=True)
+
+# ━━━ NEW: Supabase Storage client (for PDF persistence) ━━━
+_supabase_client = None
+
+def _get_supabase():
+    global _supabase_client
+    if _supabase_client is None and SUPABASE_URL and SUPABASE_KEY:
+        from supabase import create_client
+        _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    return _supabase_client
 
 
 class QueryRequest(BaseModel):
@@ -27,11 +39,38 @@ async def ingest(file: UploadFile = File(...)):
     if ext not in (".pdf", ".txt", ".md"):
         raise HTTPException(400, f"Unsupported file type: {ext}")
 
+    # Read file bytes once
+    file_bytes = await file.read()
+
+    # Save locally (temp) for text extraction
     file_path = os.path.join(DOCUMENTS_DIR, file.filename)
     with open(file_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+        f.write(file_bytes)
 
+    # ━━━ NEW: Upload to Supabase Storage (persistent copy) ━━━
+    sb = _get_supabase()
+    if sb:
+        try:
+            sb.storage.from_("documents").upload(
+                path=file.filename,
+                file=file_bytes,
+                file_options={
+                    "content-type": file.content_type or "application/octet-stream",
+                    "upsert": "true",
+                },
+            )
+        except Exception as e:
+            print(f"Warning: Failed to upload to Supabase Storage: {e}")
+
+    # Ingest (extract text, chunk, index, save to DB)
     chunks = ingest_file(file_path)
+
+    # ━━━ NEW: Clean up local temp file ━━━
+    try:
+        os.remove(file_path)
+    except OSError:
+        pass
+
     return {"filename": file.filename, "chunks": chunks}
 
 

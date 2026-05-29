@@ -1,7 +1,10 @@
+# rag.py
+
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from pathlib import Path
 
@@ -14,7 +17,6 @@ from pypdf import PdfReader
 from app.config import (
     PROVIDERS,
     DEFAULT_PROVIDER,
-    CHROMA_PERSIST_DIR,
     PARENT_CHUNK_SIZE,
     PARENT_CHUNK_OVERLAP,
     CHILD_CHUNK_SIZE,
@@ -24,7 +26,11 @@ from app.config import (
     TOP_K_FINAL,
     MAX_HISTORY_TURNS,
 )
+from app.database import get_db  # ━━━ NEW
 
+logger = logging.getLogger(__name__)  # ━━━ NEW
+
+# ── LLM ──────────────────────────────────────────────
 _current_provider: str = DEFAULT_PROVIDER
 _current_model: str = PROVIDERS[DEFAULT_PROVIDER]["default_model"]
 _llm_clients: dict[str, OpenAI] = {}
@@ -52,7 +58,12 @@ def set_model(provider: str, model: str):
 
 def get_current_model() -> dict:
     return {"provider": _current_provider, "model": _current_model}
-_chroma = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CHANGED: ChromaDB is now IN-MEMORY (not PersistentClient)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+_chroma = chromadb.Client()  # ← WAS: chromadb.PersistentClient(path=...)
 _child_collection = _chroma.get_or_create_collection(
     name="child_chunks_v2",
     metadata={"hnsw:space": "cosine"},
@@ -63,7 +74,7 @@ _bm25_corpus: list[dict] = []
 _bm25_index: BM25Okapi | None = None
 
 
-
+# ── Text Extraction (UNCHANGED) ─────────────────────
 def _extract_text(file_path: str) -> list[dict]:
     path = Path(file_path)
     ext = path.suffix.lower()
@@ -84,7 +95,7 @@ def _extract_text(file_path: str) -> list[dict]:
         raise ValueError(f"Unsupported file type: {ext}")
 
 
-
+# ── Chunking (UNCHANGED) ────────────────────────────
 def _split_text(text: str, chunk_size: int, overlap: int) -> list[str]:
     chunks = []
     start = 0
@@ -134,7 +145,7 @@ def _chunk_document(pages: list[dict]) -> tuple[list[dict], list[dict]]:
     return parents, children
 
 
-
+# ── BM25 (UNCHANGED) ────────────────────────────────
 def _tokenize(text: str) -> list[str]:
     return re.findall(r"\w+", text.lower())
 
@@ -161,38 +172,123 @@ def _rebuild_bm25():
         _bm25_index = None
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# NEW: Save chunks to PostgreSQL
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def _save_chunks_to_db(parents: list[dict], children: list[dict]):
+    """Save parent and child chunks to PostgreSQL for persistence."""
+    with get_db() as conn:
+        cur = conn.cursor()
 
+        for p in parents:
+            cur.execute(
+                """INSERT INTO parent_chunks (id, text, source, page)
+                   VALUES (%s, %s, %s, %s)
+                   ON CONFLICT (id) DO UPDATE SET text = EXCLUDED.text""",
+                (p["id"], p["text"], p["source"], p["page"]),
+            )
+
+        for c in children:
+            cur.execute(
+                """INSERT INTO child_chunks (id, parent_id, text, source, page)
+                   VALUES (%s, %s, %s, %s, %s)
+                   ON CONFLICT (id) DO UPDATE SET text = EXCLUDED.text""",
+                (c["id"], c["parent_id"], c["text"], c["source"], c["page"]),
+            )
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# NEW: Rebuild in-memory indexes from PostgreSQL on cold start
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def _rebuild_from_db():
+    """Rebuild ChromaDB + BM25 + parent_store from PostgreSQL."""
+    global _parent_store
+
+    logger.info("Rebuilding indexes from database...")
+
+    with get_db() as conn:
+        cur = conn.cursor()
+
+        # Load parent chunks
+        cur.execute("SELECT id, text, source, page FROM parent_chunks")
+        parents = cur.fetchall()
+        for p in parents:
+            _parent_store[p["id"]] = {
+                "id": p["id"],
+                "text": p["text"],
+                "source": p["source"],
+                "page": p["page"],
+            }
+
+        # Load child chunks
+        cur.execute("SELECT id, parent_id, text, source, page FROM child_chunks")
+        children = cur.fetchall()
+
+    if not children:
+        logger.info("No chunks found in database. Starting fresh.")
+        return
+
+    # Upsert into ChromaDB in batches
+    batch_size = 100
+    for i in range(0, len(children), batch_size):
+        batch = children[i : i + batch_size]
+        _child_collection.upsert(
+            ids=[c["id"] for c in batch],
+            documents=[c["text"] for c in batch],
+            metadatas=[
+                {
+                    "parent_id": c["parent_id"],
+                    "source": c["source"],
+                    "page": c["page"] if c["page"] is not None else -1,
+                }
+                for c in batch
+            ],
+        )
+
+    # Rebuild BM25
+    _rebuild_bm25()
+
+    logger.info(
+        f"Rebuilt {len(parents)} parent chunks, "
+        f"{len(children)} child chunks from database."
+    )
+
+
+# ── Ingest (MODIFIED — now saves to DB too) ─────────
 def ingest_file(file_path: str) -> int:
     pages = _extract_text(file_path)
     parents, children = _chunk_document(pages)
 
+    # 1) Save to in-memory stores
     for p in parents:
         _parent_store[p["id"]] = p
 
     batch_size = 100
     for i in range(0, len(children), batch_size):
         batch = children[i : i + batch_size]
-        texts = [c["text"] for c in batch]
-        ids = [c["id"] for c in batch]
-        metadatas = [
-            {
-                "parent_id": c["parent_id"],
-                "source": c["source"],
-                "page": c["page"] if c["page"] is not None else -1,
-            }
-            for c in batch
-        ]
         _child_collection.upsert(
-            ids=ids,
-            documents=texts,
-            metadatas=metadatas,
+            ids=[c["id"] for c in batch],
+            documents=[c["text"] for c in batch],
+            metadatas=[
+                {
+                    "parent_id": c["parent_id"],
+                    "source": c["source"],
+                    "page": c["page"] if c["page"] is not None else -1,
+                }
+                for c in batch
+            ],
         )
 
+    # 2) Save to PostgreSQL (PERSISTENT!) ━━━ NEW
+    _save_chunks_to_db(parents, children)
+
+    # 3) Rebuild BM25
     _rebuild_bm25()
+
     return len(children)
 
 
-
+# ── Search & Retrieval (ALL UNCHANGED below) ────────
 def _rrf_fuse(
     ranked_lists: list[list[str]], k: int = 60
 ) -> list[str]:
@@ -283,7 +379,6 @@ def _hybrid_search(query: str, top_k: int = TOP_K_FINAL) -> list[dict]:
         return candidates[:top_k]
 
 
-
 def _reformulate_query(question: str, history: list[dict]) -> str:
     if not history:
         return question
@@ -317,10 +412,8 @@ def _reformulate_query(question: str, history: list[dict]) -> str:
     return resp.choices[0].message.content.strip()
 
 
-
 def query(question: str, history: list[dict] | None = None):
     search_query = _reformulate_query(question, history or [])
-
     results = _hybrid_search(search_query)
 
     seen_parents = set()
@@ -388,7 +481,6 @@ def query_sync(question: str, history: list[dict] | None = None) -> dict:
     return {"answer": answer, "sources": sources}
 
 
-
 def get_stats() -> dict:
     child_count = _child_collection.count()
     return {
@@ -396,3 +488,9 @@ def get_stats() -> dict:
         "parent_chunks": len(_parent_store),
         "child_chunks": child_count,
     }
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# STARTUP: Rebuild indexes from database on cold start
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+_rebuild_from_db()
