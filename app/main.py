@@ -1,11 +1,9 @@
-# main.py
-
 import json
 import os
-import shutil
 from pathlib import Path
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -14,10 +12,20 @@ from app.rag import ingest_file, query, query_sync, get_stats, set_model, get_cu
 
 app = FastAPI(title="RAG Chatbot API")
 
+# ── CORS (needed if Streamlit is on a different domain) ──
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 os.makedirs(DOCUMENTS_DIR, exist_ok=True)
 
-# ━━━ NEW: Supabase Storage client (for PDF persistence) ━━━
+# ── Supabase Storage client (lazy) ──────────────
 _supabase_client = None
+
 
 def _get_supabase():
     global _supabase_client
@@ -39,7 +47,6 @@ async def ingest(file: UploadFile = File(...)):
     if ext not in (".pdf", ".txt", ".md"):
         raise HTTPException(400, f"Unsupported file type: {ext}")
 
-    # Read file bytes once
     file_bytes = await file.read()
 
     # Save locally (temp) for text extraction
@@ -47,25 +54,23 @@ async def ingest(file: UploadFile = File(...)):
     with open(file_path, "wb") as f:
         f.write(file_bytes)
 
-    # ━━━ NEW: Upload to Supabase Storage (persistent copy) ━━━
+    # Upload to Supabase Storage (persistent copy)
+    # Upload to Supabase Storage (persistent copy)
     sb = _get_supabase()
     if sb:
         try:
             sb.storage.from_("documents").upload(
-                path=file.filename,
                 file=file_bytes,
-                file_options={
-                    "content-type": file.content_type or "application/octet-stream",
-                    "upsert": "true",
-                },
+                path=file.filename,
+                file_options={"upsert": "true"},
             )
         except Exception as e:
-            print(f"Warning: Failed to upload to Supabase Storage: {e}")
+            print(f"Warning: Supabase Storage upload failed: {e}")
 
-    # Ingest (extract text, chunk, index, save to DB)
+    # Ingest (extract → chunk → embed → store in PostgreSQL)
     chunks = ingest_file(file_path)
 
-    # ━━━ NEW: Clean up local temp file ━━━
+    # Clean up local temp file
     try:
         os.remove(file_path)
     except OSError:

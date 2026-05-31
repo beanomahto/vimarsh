@@ -1,20 +1,16 @@
-# rag.py
-
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import re
 from pathlib import Path
 
-import chromadb
-from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
 from openai import OpenAI
-from rank_bm25 import BM25Okapi
 from pypdf import PdfReader
 
 from app.config import (
+    OPENAI_API_KEY,
+    EMBEDDING_MODEL,
     PROVIDERS,
     DEFAULT_PROVIDER,
     PARENT_CHUNK_SIZE,
@@ -22,26 +18,36 @@ from app.config import (
     CHILD_CHUNK_SIZE,
     CHILD_CHUNK_OVERLAP,
     TOP_K_VECTOR,
-    TOP_K_BM25,
+    TOP_K_FTS,
     TOP_K_FINAL,
     MAX_HISTORY_TURNS,
 )
-from app.database import get_db  # ━━━ NEW
+from app.database import get_db
 
-logger = logging.getLogger(__name__)  # ━━━ NEW
+logger = logging.getLogger(__name__)
 
-# ── LLM ──────────────────────────────────────────────
+# ── LLM ──────────────────────────────────────────
 _current_provider: str = DEFAULT_PROVIDER
 _current_model: str = PROVIDERS[DEFAULT_PROVIDER]["default_model"]
 _llm_clients: dict[str, OpenAI] = {}
-_embed_fn = DefaultEmbeddingFunction()
+
+# ── Embedding client (always OpenAI) ─────────────
+_embed_client: OpenAI | None = None
+
+
+def _get_embed_client() -> OpenAI:
+    global _embed_client
+    if _embed_client is None:
+        _embed_client = OpenAI(api_key=OPENAI_API_KEY)
+    return _embed_client
 
 
 def _get_llm() -> tuple[OpenAI, str]:
     if _current_provider not in _llm_clients:
         cfg = PROVIDERS[_current_provider]
         _llm_clients[_current_provider] = OpenAI(
-            api_key=cfg["api_key"], base_url=cfg["base_url"],
+            api_key=cfg["api_key"],
+            base_url=cfg["base_url"],
         )
     return _llm_clients[_current_provider], _current_model
 
@@ -60,21 +66,24 @@ def get_current_model() -> dict:
     return {"provider": _current_provider, "model": _current_model}
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CHANGED: ChromaDB is now IN-MEMORY (not PersistentClient)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-_chroma = chromadb.Client()  # ← WAS: chromadb.PersistentClient(path=...)
-_child_collection = _chroma.get_or_create_collection(
-    name="child_chunks_v2",
-    metadata={"hnsw:space": "cosine"},
-    embedding_function=_embed_fn,
-)
-_parent_store: dict[str, dict] = {}
-_bm25_corpus: list[dict] = []
-_bm25_index: BM25Okapi | None = None
+# ── Embeddings via OpenAI API (NO local model!) ─
+def _get_embeddings(texts: list[str]) -> list[list[float]]:
+    """Get embeddings for a batch of texts using OpenAI API."""
+    client = _get_embed_client()
+    # OpenAI supports up to 2048 inputs per call
+    resp = client.embeddings.create(
+        model=EMBEDDING_MODEL,
+        input=texts,
+    )
+    return [item.embedding for item in resp.data]
 
 
-# ── Text Extraction (UNCHANGED) ─────────────────────
+def _get_embedding(text: str) -> list[float]:
+    """Get embedding for a single text."""
+    return _get_embeddings([text])[0]
+
+
+# ── Text Extraction ─────────────────────────────
 def _extract_text(file_path: str) -> list[dict]:
     path = Path(file_path)
     ext = path.suffix.lower()
@@ -95,7 +104,7 @@ def _extract_text(file_path: str) -> list[dict]:
         raise ValueError(f"Unsupported file type: {ext}")
 
 
-# ── Chunking (UNCHANGED) ────────────────────────────
+# ── Chunking ─────────────────────────────────────
 def _split_text(text: str, chunk_size: int, overlap: int) -> list[str]:
     chunks = []
     start = 0
@@ -131,7 +140,9 @@ def _chunk_document(pages: list[dict]) -> tuple[list[dict], list[dict]]:
                 "page": page,
             })
 
-            child_chunks = _split_text(parent_text, CHILD_CHUNK_SIZE, CHILD_CHUNK_OVERLAP)
+            child_chunks = _split_text(
+                parent_text, CHILD_CHUNK_SIZE, CHILD_CHUNK_OVERLAP
+            )
             for ci, child_text in enumerate(child_chunks):
                 child_id = f"{parent_id}_c{ci}"
                 children.append({
@@ -145,38 +156,24 @@ def _chunk_document(pages: list[dict]) -> tuple[list[dict], list[dict]]:
     return parents, children
 
 
-# ── BM25 (UNCHANGED) ────────────────────────────────
-def _tokenize(text: str) -> list[str]:
-    return re.findall(r"\w+", text.lower())
+# ── Ingest ───────────────────────────────────────
+def ingest_file(file_path: str) -> int:
+    """Extract, chunk, embed, and store everything in PostgreSQL."""
+    pages = _extract_text(file_path)
+    parents, children = _chunk_document(pages)
 
+    if not children:
+        return 0
 
-def _rebuild_bm25():
-    global _bm25_index, _bm25_corpus
-    results = _child_collection.get(include=["documents", "metadatas"])
-    _bm25_corpus = []
-    for doc_id, doc_text, meta in zip(
-        results["ids"], results["documents"], results["metadatas"]
-    ):
-        _bm25_corpus.append({
-            "id": doc_id,
-            "text": doc_text,
-            "parent_id": meta.get("parent_id", ""),
-            "source": meta.get("source", ""),
-            "page": meta.get("page"),
-        })
+    # Compute embeddings via OpenAI API (batched)
+    child_texts = [c["text"] for c in children]
+    all_embeddings: list[list[float]] = []
+    batch_size = 100
+    for i in range(0, len(child_texts), batch_size):
+        batch = child_texts[i : i + batch_size]
+        all_embeddings.extend(_get_embeddings(batch))
 
-    if _bm25_corpus:
-        tokenized = [_tokenize(c["text"]) for c in _bm25_corpus]
-        _bm25_index = BM25Okapi(tokenized)
-    else:
-        _bm25_index = None
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# NEW: Save chunks to PostgreSQL
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def _save_chunks_to_db(parents: list[dict], children: list[dict]):
-    """Save parent and child chunks to PostgreSQL for persistence."""
+    # Store everything in PostgreSQL (persistent!)
     with get_db() as conn:
         cur = conn.cursor()
 
@@ -184,154 +181,88 @@ def _save_chunks_to_db(parents: list[dict], children: list[dict]):
             cur.execute(
                 """INSERT INTO parent_chunks (id, text, source, page)
                    VALUES (%s, %s, %s, %s)
-                   ON CONFLICT (id) DO UPDATE SET text = EXCLUDED.text""",
+                   ON CONFLICT (id) DO UPDATE
+                   SET text = EXCLUDED.text""",
                 (p["id"], p["text"], p["source"], p["page"]),
             )
 
-        for c in children:
+        for c, emb in zip(children, all_embeddings):
             cur.execute(
-                """INSERT INTO child_chunks (id, parent_id, text, source, page)
-                   VALUES (%s, %s, %s, %s, %s)
-                   ON CONFLICT (id) DO UPDATE SET text = EXCLUDED.text""",
-                (c["id"], c["parent_id"], c["text"], c["source"], c["page"]),
+                """INSERT INTO child_chunks (id, parent_id, text, source, page, embedding)
+                   VALUES (%s, %s, %s, %s, %s, %s::vector)
+                   ON CONFLICT (id) DO UPDATE
+                   SET text = EXCLUDED.text, embedding = EXCLUDED.embedding""",
+                (
+                    c["id"],
+                    c["parent_id"],
+                    c["text"],
+                    c["source"],
+                    c["page"],
+                    str(emb),
+                ),
             )
 
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# NEW: Rebuild in-memory indexes from PostgreSQL on cold start
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def _rebuild_from_db():
-    """Rebuild ChromaDB + BM25 + parent_store from PostgreSQL."""
-    global _parent_store
-
-    logger.info("Rebuilding indexes from database...")
-
-    with get_db() as conn:
-        cur = conn.cursor()
-
-        # Load parent chunks
-        cur.execute("SELECT id, text, source, page FROM parent_chunks")
-        parents = cur.fetchall()
-        for p in parents:
-            _parent_store[p["id"]] = {
-                "id": p["id"],
-                "text": p["text"],
-                "source": p["source"],
-                "page": p["page"],
-            }
-
-        # Load child chunks
-        cur.execute("SELECT id, parent_id, text, source, page FROM child_chunks")
-        children = cur.fetchall()
-
-    if not children:
-        logger.info("No chunks found in database. Starting fresh.")
-        return
-
-    # Upsert into ChromaDB in batches
-    batch_size = 100
-    for i in range(0, len(children), batch_size):
-        batch = children[i : i + batch_size]
-        _child_collection.upsert(
-            ids=[c["id"] for c in batch],
-            documents=[c["text"] for c in batch],
-            metadatas=[
-                {
-                    "parent_id": c["parent_id"],
-                    "source": c["source"],
-                    "page": c["page"] if c["page"] is not None else -1,
-                }
-                for c in batch
-            ],
-        )
-
-    # Rebuild BM25
-    _rebuild_bm25()
-
     logger.info(
-        f"Rebuilt {len(parents)} parent chunks, "
-        f"{len(children)} child chunks from database."
+        f"Ingested {len(parents)} parents, {len(children)} children from {file_path}"
     )
-
-
-# ── Ingest (MODIFIED — now saves to DB too) ─────────
-def ingest_file(file_path: str) -> int:
-    pages = _extract_text(file_path)
-    parents, children = _chunk_document(pages)
-
-    # 1) Save to in-memory stores
-    for p in parents:
-        _parent_store[p["id"]] = p
-
-    batch_size = 100
-    for i in range(0, len(children), batch_size):
-        batch = children[i : i + batch_size]
-        _child_collection.upsert(
-            ids=[c["id"] for c in batch],
-            documents=[c["text"] for c in batch],
-            metadatas=[
-                {
-                    "parent_id": c["parent_id"],
-                    "source": c["source"],
-                    "page": c["page"] if c["page"] is not None else -1,
-                }
-                for c in batch
-            ],
-        )
-
-    # 2) Save to PostgreSQL (PERSISTENT!) ━━━ NEW
-    _save_chunks_to_db(parents, children)
-
-    # 3) Rebuild BM25
-    _rebuild_bm25()
-
     return len(children)
 
 
-# ── Search & Retrieval (ALL UNCHANGED below) ────────
-def _rrf_fuse(
-    ranked_lists: list[list[str]], k: int = 60
-) -> list[str]:
+# ── Hybrid Search (pgvector + full-text search) ─
+def _rrf_fuse(ranked_lists: list[list[str]], k: int = 60) -> list[str]:
+    """Reciprocal Rank Fusion."""
     scores: dict[str, float] = {}
     for ranked in ranked_lists:
         for rank, doc_id in enumerate(ranked):
             scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank + 1)
-    sorted_ids = sorted(scores, key=scores.get, reverse=True)
-    return sorted_ids
+    return sorted(scores, key=scores.get, reverse=True)
 
 
-def _hybrid_search(query: str, top_k: int = TOP_K_FINAL) -> list[dict]:
-    vector_results = _child_collection.query(
-        query_texts=[query],
-        n_results=min(TOP_K_VECTOR, _child_collection.count() or 1),
-        include=["documents", "metadatas"],
-    )
-    vector_ids = vector_results["ids"][0] if vector_results["ids"] else []
+def _hybrid_search(search_query: str, top_k: int = TOP_K_FINAL) -> list[dict]:
+    """
+    Hybrid search: pgvector cosine similarity + PostgreSQL full-text search,
+    fused with RRF, then LLM-reranked.
+    """
+    query_embedding = _get_embedding(search_query)
 
-    bm25_ids = []
-    if _bm25_index is not None and _bm25_corpus:
-        tokenized_query = _tokenize(query)
-        bm25_scores = _bm25_index.get_scores(tokenized_query)
-        scored = list(zip(range(len(_bm25_corpus)), bm25_scores))
-        scored.sort(key=lambda x: x[1], reverse=True)
-        bm25_ids = [_bm25_corpus[idx]["id"] for idx, _ in scored[:TOP_K_BM25]]
+    with get_db() as conn:
+        cur = conn.cursor()
 
-    fused_ids = _rrf_fuse([vector_ids, bm25_ids])
+        # ── 1. Vector search (pgvector) ──────────
+        cur.execute(
+            """SELECT id, parent_id, text, source, page
+               FROM child_chunks
+               WHERE embedding IS NOT NULL
+               ORDER BY embedding <=> %s::vector
+               LIMIT %s""",
+            (str(query_embedding), TOP_K_VECTOR),
+        )
+        vector_results = cur.fetchall()
 
-    all_results = {}
-    if vector_results["ids"] and vector_results["ids"][0]:
-        for i, vid in enumerate(vector_results["ids"][0]):
-            all_results[vid] = {
-                "id": vid,
-                "text": vector_results["documents"][0][i],
-                "parent_id": vector_results["metadatas"][0][i].get("parent_id", ""),
-                "source": vector_results["metadatas"][0][i].get("source", ""),
-                "page": vector_results["metadatas"][0][i].get("page"),
-            }
+        # ── 2. Full-text search (tsvector) ───────
+        cur.execute(
+            """SELECT id, parent_id, text, source, page,
+                      ts_rank_cd(tsv, query) AS rank
+               FROM child_chunks, plainto_tsquery('english', %s) query
+               WHERE tsv @@ query
+               ORDER BY rank DESC
+               LIMIT %s""",
+            (search_query, TOP_K_FTS),
+        )
+        fts_results = cur.fetchall()
 
-    for c in _bm25_corpus:
-        if c["id"] not in all_results:
-            all_results[c["id"]] = c
+    # ── 3. RRF Fusion ────────────────────────────
+    vector_ids = [r["id"] for r in vector_results]
+    fts_ids = [r["id"] for r in fts_results]
+    fused_ids = _rrf_fuse([vector_ids, fts_ids])
+
+    # Build lookup of all results
+    all_results: dict[str, dict] = {}
+    for r in vector_results:
+        all_results[r["id"]] = dict(r)
+    for r in fts_results:
+        if r["id"] not in all_results:
+            all_results[r["id"]] = dict(r)
 
     candidates = []
     for fid in fused_ids:
@@ -343,6 +274,7 @@ def _hybrid_search(query: str, top_k: int = TOP_K_FINAL) -> list[dict]:
     if not candidates:
         return []
 
+    # ── 4. LLM Reranking ────────────────────────
     docs_text = "\n\n".join(
         f"[DOC {i}]: {c['text'][:500]}" for i, c in enumerate(candidates)
     )
@@ -354,13 +286,14 @@ def _hybrid_search(query: str, top_k: int = TOP_K_FINAL) -> list[dict]:
                 "role": "system",
                 "content": (
                     "You are a relevance ranker. Given a query and documents, "
-                    "return the indices of the most relevant documents in order of relevance. "
-                    "Return ONLY comma-separated indices (e.g. '3,0,5,1'), nothing else."
+                    "return the indices of the most relevant documents in order "
+                    "of relevance. Return ONLY comma-separated indices "
+                    "(e.g. '3,0,5,1'), nothing else."
                 ),
             },
             {
                 "role": "user",
-                "content": f"Query: {query}\n\nDocuments:\n{docs_text}",
+                "content": f"Query: {search_query}\n\nDocuments:\n{docs_text}",
             },
         ],
         temperature=0,
@@ -379,6 +312,7 @@ def _hybrid_search(query: str, top_k: int = TOP_K_FINAL) -> list[dict]:
         return candidates[:top_k]
 
 
+# ── Query Reformulation ─────────────────────────
 def _reformulate_query(question: str, history: list[dict]) -> str:
     if not history:
         return question
@@ -412,6 +346,20 @@ def _reformulate_query(question: str, history: list[dict]) -> str:
     return resp.choices[0].message.content.strip()
 
 
+# ── Get parent chunk from DB (no in-memory store!) ─
+def _get_parent(parent_id: str) -> dict | None:
+    """Fetch a single parent chunk from PostgreSQL."""
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, text, source, page FROM parent_chunks WHERE id = %s",
+            (parent_id,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+
+# ── Main Query (streaming) ──────────────────────
 def query(question: str, history: list[dict] | None = None):
     search_query = _reformulate_query(question, history or [])
     results = _hybrid_search(search_query)
@@ -422,7 +370,7 @@ def query(question: str, history: list[dict] | None = None):
 
     for child in results:
         parent_id = child.get("parent_id", "")
-        parent = _parent_store.get(parent_id)
+        parent = _get_parent(parent_id)  # ← fetch from DB, not memory
 
         if parent and parent_id not in seen_parents:
             seen_parents.add(parent_id)
@@ -431,7 +379,7 @@ def query(question: str, history: list[dict] | None = None):
             sources.append({
                 "content": parent["text"][:300],
                 "source": parent.get("source", "unknown"),
-                "page": page if page != -1 else None,
+                "page": page if page and page != -1 else None,
             })
         elif not parent:
             context_parts.append(child["text"])
@@ -439,7 +387,7 @@ def query(question: str, history: list[dict] | None = None):
             sources.append({
                 "content": child["text"][:300],
                 "source": child.get("source", "unknown"),
-                "page": page if page != -1 else None,
+                "page": page if page and page != -1 else None,
             })
 
     context = "\n\n---\n\n".join(context_parts)
@@ -448,8 +396,9 @@ def query(question: str, history: list[dict] | None = None):
         {
             "role": "system",
             "content": (
-                "You are a helpful assistant. Answer the question based on the provided context. "
-                "If the answer is not in the context, say so. Be concise and accurate."
+                "You are a helpful assistant. Answer the question based on "
+                "the provided context. If the answer is not in the context, "
+                "say so. Be concise and accurate."
             ),
         },
         {
@@ -481,16 +430,22 @@ def query_sync(question: str, history: list[dict] | None = None) -> dict:
     return {"answer": answer, "sources": sources}
 
 
+# ── Stats (from DB, not memory) ──────────────────
 def get_stats() -> dict:
-    child_count = _child_collection.count()
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) AS count FROM child_chunks")
+        child_count = cur.fetchone()["count"]
+        cur.execute("SELECT COUNT(*) AS count FROM parent_chunks")
+        parent_count = cur.fetchone()["count"]
     return {
         "total_chunks": child_count,
-        "parent_chunks": len(_parent_store),
+        "parent_chunks": parent_count,
         "child_chunks": child_count,
     }
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# STARTUP: Rebuild indexes from database on cold start
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# _rebuild_from_db()
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# NO _rebuild_from_db() needed!
+# Everything is already in PostgreSQL. Zero cold-start cost.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

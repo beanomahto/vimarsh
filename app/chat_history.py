@@ -1,5 +1,3 @@
-# chat_history.py
-
 from __future__ import annotations
 
 import json
@@ -42,7 +40,11 @@ def get_messages(chat_id: int) -> list[dict]:
         for row in rows:
             msg = {"role": row["role"], "content": row["content"]}
             if row["sources"]:
-                msg["sources"] = row["sources"] if isinstance(row["sources"], list) else json.loads(row["sources"])
+                msg["sources"] = (
+                    row["sources"]
+                    if isinstance(row["sources"], list)
+                    else json.loads(row["sources"])
+                )
             result.append(msg)
         return result
 
@@ -73,5 +75,4 @@ def update_title(chat_id: int, title: str):
 def delete_chat(chat_id: int):
     with get_db() as conn:
         cur = conn.cursor()
-        # Messages auto-deleted via ON DELETE CASCADE
         cur.execute("DELETE FROM chats WHERE id = %s", (chat_id,))

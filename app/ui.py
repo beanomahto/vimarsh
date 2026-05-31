@@ -1,7 +1,5 @@
-# ui.py
-
 import json
-
+import os
 import requests
 import streamlit as st
 
@@ -14,14 +12,12 @@ from app.chat_history import (
     update_title, delete_chat,
 )
 
-#API_URL = "http://localhost:8000"
-API_URL = "https://vimarsh-l5x7.onrender.com"
-
-
+# ── Configurable API URL (for deployment) ────────
+API_URL = os.getenv("API_URL", "http://localhost:8000")
 
 st.set_page_config(page_title="RAG Chatbot", page_icon="🤖", layout="wide")
 st.title("RAG Chatbot")
-st.caption("Hybrid search (BM25 + vector) with re-ranking and streaming")
+st.caption("Hybrid search (pgvector + full-text) with re-ranking and streaming")
 
 if "chat_id" not in st.session_state:
     st.session_state.chat_id = None
@@ -69,7 +65,9 @@ with st.sidebar:
                 )
                 if resp.status_code == 200:
                     data = resp.json()
-                    st.success(f"{uploaded_file.name}: {data['chunks']} chunks indexed")
+                    st.success(
+                        f"{uploaded_file.name}: {data['chunks']} chunks indexed"
+                    )
                 else:
                     st.error(f"Failed to process {uploaded_file.name}")
 
@@ -84,12 +82,20 @@ with st.sidebar:
         provider = st.selectbox(
             "Provider",
             available,
-            index=available.index(current["provider"]) if current["provider"] in available else 0,
+            index=(
+                available.index(current["provider"])
+                if current["provider"] in available
+                else 0
+            ),
             key="provider_select",
         )
 
         models = providers[provider]["models"]
-        cur_model = current["model"] if current["provider"] == provider else providers[provider]["default_model"]
+        cur_model = (
+            current["model"]
+            if current["provider"] == provider
+            else providers[provider]["default_model"]
+        )
         model = st.selectbox(
             "Model",
             models,
@@ -120,11 +126,12 @@ with st.sidebar:
     st.divider()
     st.subheader("Architecture")
     st.markdown(
-        "- **Search**: Hybrid (BM25 + Vector + RRF)\n"
-        "- **Re-ranking**: LLM-based\n"
+        "- **Vector**: pgvector (Supabase)\n"
+        "- **Keyword**: PostgreSQL full-text search\n"
+        "- **Fusion**: RRF + LLM re-ranking\n"
         "- **Chunking**: Parent-child\n"
-        "- **Embeddings**: Local (all-MiniLM-L6-v2)\n"
-        "- **LLM**: Groq / OpenAI (streaming)\n"
+        "- **Embeddings**: OpenAI `text-embedding-3-small`\n"
+        "- **LLM**: OpenAI / Groq (streaming)\n"
         "- **Memory**: Multi-turn with query reformulation"
     )
 
@@ -134,6 +141,7 @@ if st.session_state.chat_id:
 else:
     messages = []
 
+# Display existing messages
 for msg in messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
@@ -147,37 +155,56 @@ for msg in messages:
                     st.text(s["content"])
 
 if prompt := st.chat_input("Ask a question about your documents"):
-    if not st.session_state.chat_id:
-        st.session_state.chat_id = create_chat(prompt[:50])
 
-    add_message(st.session_state.chat_id, "user", prompt)
-
-    chats_list = list_chats()
-    current = next((c for c in chats_list if c["id"] == st.session_state.chat_id), None)
-    if current and current["title"] == "New Chat":
-        update_title(st.session_state.chat_id, prompt[:50])
-
+    # ── 1. Show user message IMMEDIATELY ─────────
     with st.chat_message("user"):
         st.markdown(prompt)
 
+    # ── 2. Show assistant "thinking" right away ──
     with st.chat_message("assistant"):
-        history = [
-            {"role": m["role"], "content": m["content"]}
-            for m in messages
-        ]
+        # Show spinner WHILE doing DB + API work
+        with st.spinner("Thinking..."):
+
+            # Create chat if needed
+            if not st.session_state.chat_id:
+                st.session_state.chat_id = create_chat(prompt[:50])
+
+            # Save user message to DB
+            add_message(st.session_state.chat_id, "user", prompt)
+
+            # Auto-title if "New Chat"
+            chats_list = list_chats()
+            current = next(
+                (c for c in chats_list if c["id"] == st.session_state.chat_id), None
+            )
+            if current and current["title"] == "New Chat":
+                update_title(st.session_state.chat_id, prompt[:50])
+
+            # Build history for context
+            history = [
+                {"role": m["role"], "content": m["content"]}
+                for m in messages
+            ]
+
+            # Call the API
+            try:
+                resp = requests.post(
+                    f"{API_URL}/query",
+                    json={"question": prompt, "history": history, "stream": True},
+                    stream=True,
+                    timeout=120,
+                )
+            except Exception as e:
+                st.error(f"API connection failed: {e}")
+                add_message(st.session_state.chat_id, "assistant", f"Error: {e}")
+                st.stop()
+
+        # ── 3. Stream the response with live tokens ──
+        answer = ""
+        sources = []
+        placeholder = st.empty()
 
         try:
-            resp = requests.post(
-                f"{API_URL}/query",
-                json={"question": prompt, "history": history, "stream": True},
-                stream=True,
-                timeout=60,
-            )
-
-            answer = ""
-            sources = []
-            placeholder = st.empty()
-
             for line in resp.iter_lines(decode_unicode=True):
                 if not line or not line.startswith("data: "):
                     continue
@@ -187,7 +214,7 @@ if prompt := st.chat_input("Ask a question about your documents"):
                     sources = data["sources"]
                 elif data["type"] == "token":
                     answer += data["content"]
-                    placeholder.markdown(answer + "▌")
+                    placeholder.markdown(answer + " ▌")
                 elif data["type"] == "done":
                     placeholder.markdown(answer)
 
@@ -205,4 +232,5 @@ if prompt := st.chat_input("Ask a question about your documents"):
             sources = []
             st.error(answer)
 
-    add_message(st.session_state.chat_id, "assistant", answer, sources)
+        # ── 4. Save assistant response to DB ─────
+        add_message(st.session_state.chat_id, "assistant", answer, sources)
