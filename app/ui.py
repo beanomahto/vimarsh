@@ -133,7 +133,9 @@ with st.sidebar:
         "- **Chunking**: Parent-child\n"
         "- **Embeddings**: OpenAI `text-embedding-3-small`\n"
         "- **LLM**: OpenAI / Groq (streaming)\n"
-        "- **Memory**: Multi-turn with query reformulation"
+        "- **Memory**: Multi-turn with query reformulation\n"
+        "- **Created By**: Intern-Bhawani Mahto"
+
     )
 
 # Load messages from DB
