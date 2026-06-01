@@ -1,10 +1,10 @@
 fastapi
 uvicorn[standard]
 python-dotenv
-psycopg2-binary
 openai
 pypdf
-pydantic
-supabase
+psycopg2-binary
 requests
+supabase
+pydantic
 streamlit

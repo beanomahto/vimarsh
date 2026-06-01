@@ -55,7 +55,6 @@ async def ingest(file: UploadFile = File(...)):
         f.write(file_bytes)
 
     # Upload to Supabase Storage (persistent copy)
-    # Upload to Supabase Storage (persistent copy)
     sb = _get_supabase()
     if sb:
         try:
